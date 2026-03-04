@@ -34,7 +34,7 @@ Usage:
 """
 
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import requests
 import json
@@ -58,6 +58,8 @@ class ProtonProxyManager:
     DEFAULT_PROXY_PORT = 4443
     DEFAULT_PROXY_SCHEME = "https"
     DEFAULT_CREDENTIALS_FILE = "proton_credentials.txt"
+    CENTRALIZED_PROXY_CACHE_DURATION = 3600  # seconds (1 hour)
+    ACCESS_TOKEN_REFRESH_BUFFER_SECONDS = 30  # refresh slightly early, not 5% early
     
     def __init__(
         self,
@@ -84,14 +86,18 @@ class ProtonProxyManager:
                              If provided, credentials will be loaded from and saved to this file
         """
         self.credentials_file = credentials_file or self.DEFAULT_CREDENTIALS_FILE
+        access_token_expires_at: Optional[datetime] = None
         
-        # Load credentials from file if not provided
-        if uid is None or access_token is None:
+        # Load any missing credentials from file.
+        # This prevents accidentally nulling refreshToken when uid/access_token are
+        # provided explicitly but refresh_token is omitted.
+        if uid is None or access_token is None or refresh_token is None:
             file_creds = self._load_credentials_file()
             if file_creds:
                 uid = uid or file_creds.get("uid")
-                access_token = access_token or file_creds.get("access_token")
+                access_token = access_token or file_creds.get("accessToken")
                 refresh_token = refresh_token or file_creds.get("refresh_token")
+                access_token_expires_at = file_creds.get("access_token_expires_at")
         
         if not uid or not access_token:
             raise ValueError("uid and access_token must be provided either as parameters or in credentials_file")
@@ -105,14 +111,18 @@ class ProtonProxyManager:
         
         self._credentials: Optional[Dict[str, Any]] = None
         self._credentials_expires_at: Optional[datetime] = None
-        self._access_token_expires_at: Optional[datetime] = None
-        self._lock = threading.Lock()
+        self._access_token_expires_at: Optional[datetime] = access_token_expires_at
+        self._centralized_proxies_cache: Optional[List[Dict[str, Any]]] = None
+        self._centralized_proxies_expires_at: Optional[datetime] = None
+        # Re-entrant lock is required because credential flows can call token
+        # validation while already inside a locked section.
+        self._lock = threading.RLock()
         
         # Save initial credentials to file if credentials_file is set
         if self.credentials_file:
             self._save_credentials_file()
     
-    def _load_credentials_file(self) -> Optional[Dict[str, str]]:
+    def _load_credentials_file(self) -> Optional[Dict[str, Any]]:
         """
         Load credentials from file.
         
@@ -125,10 +135,19 @@ class ProtonProxyManager:
         try:
             with open(self.credentials_file, "r") as f:
                 data = json.load(f)
+                access_token_expires_at = None
+                expires_at_raw = data.get("accessTokenExpiresAt")
+                if isinstance(expires_at_raw, str) and expires_at_raw:
+                    try:
+                        # Stored in ISO 8601 format.
+                        access_token_expires_at = datetime.fromisoformat(expires_at_raw)
+                    except ValueError:
+                        access_token_expires_at = None
                 return {
                     "uid": data.get("uid"),
-                    "access_token": data.get("access_token"),
-                    "refresh_token": data.get("refresh_token"),
+                    "accessToken": data.get("accessToken"),
+                    "refresh_token": data.get("refreshToken"),
+                    "access_token_expires_at": access_token_expires_at,
                 }
         except (json.JSONDecodeError, IOError, KeyError):
             return None
@@ -151,10 +170,15 @@ class ProtonProxyManager:
             try:
                 data = {
                     "uid": self.uid,
-                    "access_token": self.access_token,
+                    "accessToken": self.access_token,
+                    # Keep file schema stable: explicit null when refresh token is unavailable.
+                    "refreshToken": self.refresh_token,
+                    "accessTokenExpiresAt": (
+                        self._access_token_expires_at.isoformat()
+                        if self._access_token_expires_at is not None
+                        else None
+                    ),
                 }
-                if self.refresh_token:
-                    data["refresh_token"] = self.refresh_token
                 
                 # Write atomically using a temporary file
                 temp_file = f"{self.credentials_file}.tmp"
@@ -218,7 +242,7 @@ class ProtonProxyManager:
         response.raise_for_status()
         
         data = response.json()
-        
+        print(data)
         if not isinstance(data, dict):
             raise ValueError(f"Invalid response format: {data}")
         
@@ -236,34 +260,45 @@ class ProtonProxyManager:
         Ensure the access token is valid, refreshing if necessary.
         """
         if not self.refresh_token:
-            # No refresh token available, can't refresh
             return
-        
+
         with self._lock:
             now = datetime.now()
-            
-            # Check if access token needs refresh (with 5% margin for safety)
+
             if (
-                self._access_token_expires_at is None or
-                now >= self._access_token_expires_at
+                self._access_token_expires_at is not None
+                and now < self._access_token_expires_at
             ):
-                # Refresh the access token
-                token_data = self._refresh_access_token()
-                
-                # Update access token and refresh token
-                self.access_token = token_data["AccessToken"]
-                if "RefreshToken" in token_data:
-                    self.refresh_token = token_data["RefreshToken"]
-                
-                # Calculate expiration time (with 5% margin for safety)
-                expires_in = token_data.get("ExpiresIn", 86400)  # Default 24 hours
-                margin = expires_in * 0.05
-                self._access_token_expires_at = now + timedelta(
-                    seconds=expires_in - margin
-                )
-                
-                # Save updated credentials to file (lock already held)
-                self._save_credentials_file(lock_held=True)
+                return
+
+            # Refresh the access token.
+            token_data = self._refresh_access_token()
+
+            # Update access token, refresh token, and UID from refresh response.
+            self.access_token = token_data["AccessToken"]
+            if "RefreshToken" in token_data and token_data["RefreshToken"]:
+                self.refresh_token = token_data["RefreshToken"]
+            new_uid = token_data.get("UID") or token_data.get("Uid")
+            if isinstance(new_uid, str) and new_uid:
+                self.uid = new_uid
+
+            # Honor ExpiresIn from payload and refresh just a few seconds early.
+            expires_in = token_data.get("ExpiresIn", 86400)  # Default 24 hours
+            try:
+                expires_in = int(expires_in)
+            except (TypeError, ValueError):
+                expires_in = 86400
+
+            refresh_buffer = self.ACCESS_TOKEN_REFRESH_BUFFER_SECONDS
+            if expires_in <= refresh_buffer:
+                refresh_buffer = 0
+
+            self._access_token_expires_at = now + timedelta(
+                seconds=max(expires_in - refresh_buffer, 0)
+            )
+
+            # Save updated credentials and expiry metadata.
+            self._save_credentials_file(lock_held=True)
     
     def _fetch_credentials(self) -> Dict[str, Any]:
         """
@@ -278,6 +313,7 @@ class ProtonProxyManager:
         """
         url = f"{self.BASE_API_URL}vpn/v1/browser/token?Duration={self.token_duration}"
         headers = self._get_auth_headers()
+        print(headers)
         
         response = requests.get(url, headers=headers, timeout=30, proxies={
             "http":"",
@@ -348,6 +384,38 @@ class ProtonProxyManager:
             "password": self._credentials["Password"],
         }
     
+    def _select_proxy_host_from_centralized(self) -> str:
+        """
+        Pick a proxy host from centralized Proton logical servers data.
+
+        Returns:
+            Proxy host/domain string.
+
+        Raises:
+            ValueError: If no usable host can be extracted.
+        """
+        logical_servers = self.get_proxies_centralized()
+        for logical_server in logical_servers:
+            if not isinstance(logical_server, dict):
+                continue
+
+            # Prefer a concrete server host if available.
+            for server in logical_server.get("Servers", []):
+                if not isinstance(server, dict):
+                    continue
+                for key in ("Domain", "EntryIP", "ExitIP", "Host", "Hostname"):
+                    value = server.get(key)
+                    if isinstance(value, str) and value:
+                        return value
+
+            # Fall back to logical-level host-like fields.
+            for key in ("Domain", "Host", "Hostname", "Name"):
+                value = logical_server.get(key)
+                if isinstance(value, str) and value:
+                    return value
+
+        raise ValueError("No usable proxy host found in centralized proxy list")
+
     def get_proxy_url(self) -> str:
         """
         Get the proxy URL in format: https://username:password@host:port
@@ -356,13 +424,9 @@ class ProtonProxyManager:
             Proxy URL string
             
         Raises:
-            ValueError: If proxy_host is not set
+            ValueError: If no proxy host can be determined
         """
-        if not self.proxy_host:
-            raise ValueError(
-                "proxy_host not set. Please set it using set_proxy_server() "
-                "or provide it during initialization."
-            )
+        proxy_host = self.proxy_host or self._select_proxy_host_from_centralized()
         
         creds = self.get_credentials()
         username = creds["username"]
@@ -376,7 +440,7 @@ class ProtonProxyManager:
         return (
             f"{self.DEFAULT_PROXY_SCHEME}://"
             f"{username_encoded}:{password_encoded}@"
-            f"{self.proxy_host}:{self.proxy_port}"
+            f"{proxy_host}:{self.proxy_port}"
         )
     
     def get_proxies(self) -> Dict[str, str]:
@@ -391,6 +455,78 @@ class ProtonProxyManager:
             "http": proxy_url,
             "https": proxy_url,
         }
+    
+    def get_proxies_centralized(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        Get centralized logical proxy servers from Proton API.
+        Results are cached in memory for 1 hour to reduce API calls.
+        
+        Args:
+            force_refresh: Ignore cache and fetch fresh data from the API.
+
+        Returns:
+            List of logical server dictionaries.
+        """
+        with self._lock:
+            now = datetime.now()
+            if (
+                not force_refresh
+                and self._centralized_proxies_cache is not None
+                and self._centralized_proxies_expires_at is not None
+                and now < self._centralized_proxies_expires_at
+            ):
+                return self._centralized_proxies_cache
+
+        # Keep centralized API calls aligned with token refresh behavior.
+        self._ensure_access_token()
+
+        headers = {
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "authorization": f"Bearer {self.access_token}",
+            "cache-control": "no-cache",
+            "if-modified-since": "Thu, 01 Jan 1970 00:00:00 GMT",
+            "pragma": "no-cache",
+            "priority": "u=1, i",
+            "sec-ch-ua": "\"Chromium\";v=\"145\", \"Not:A-Brand\";v=\"99\"",
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": "\"macOS\"",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "none",
+            "sec-fetch-storage-access": "active",
+            "x-pm-appversion": "browser-vpn@1.2.15",
+            "x-pm-browser-type": "",
+            "x-pm-country": "GB",
+            "x-pm-max-tier": "2",
+            "x-pm-netzone": "31.94.60.0",
+            "x-pm-response-truncation-permitted": "true",
+            "x-pm-single-group": "vpn-paid",
+            "x-pm-uid": self.uid
+        }
+        
+        response = requests.get("https://account.proton.me/api/vpn/v1/logicals", headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid response format: {data}")
+        if data.get("Code") != 1000:
+            error_msg = data.get("Error", "Unknown error")
+            raise ValueError(f"API error: {error_msg}")
+        if "LogicalServers" not in data:
+            raise ValueError("Missing LogicalServers in response")
+        
+        logical_servers = data["LogicalServers"]
+        if not isinstance(logical_servers, list):
+            raise ValueError("Invalid LogicalServers format in response")
+
+        with self._lock:
+            self._centralized_proxies_cache = logical_servers
+            self._centralized_proxies_expires_at = (
+                datetime.now() + timedelta(seconds=self.CENTRALIZED_PROXY_CACHE_DURATION)
+            )
+
+        return logical_servers
     
     def get_session(self, **session_kwargs) -> requests.Session:
         """
